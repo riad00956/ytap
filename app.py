@@ -4,18 +4,19 @@ import json
 import asyncio
 import logging
 import threading
-import sqlite3
-import time
 import uuid
 import io
 import shutil
-from datetime import datetime
-from typing import Dict, Optional, List, Any
+import time
 from contextlib import asynccontextmanager
 
+# 1. Nest Asyncio সেটআপ (Render এর জন্য জরুরি)
+import nest_asyncio
+nest_asyncio.apply()
+
 # FastAPI imports
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -33,53 +34,55 @@ from telegram.ext import (
 
 # Other imports
 import yt_dlp
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
 import aiohttp
+
+# Matplotlib সেটআপ (Error Handling সহ)
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    print("WARNING: Matplotlib not available, graphs will be disabled.")
+    MATPLOTLIB_AVAILABLE = False
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-# Render থেকে বা .env থেকে টোকেন নেবে
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-# লোকাল টেস্টের জন্য যদি এনভায়রনমেন্ট না থাকে (সতর্কতা: প্রোডাকশনে এটা সরাবেন)
-if not BOT_TOKEN:
-    print("WARNING: BOT_TOKEN not set. Bot will not start correctly.")
-
-# Render পোর্টের জন্য সেটআপ
-PORT = int(os.environ.get("PORT", 8000))
-SERVER_URL = f"http://localhost:{PORT}" 
-
-DOWNLOAD_DIR = "downloads"
-# FFmpeg পাথ সেট করা (build.sh এর মাধ্যমে যেখানে ইন্সটল হয়েছে)
-os.environ["PATH"] += os.pathsep + os.path.join(os.getcwd(), "bin")
-
-# Ensure download directory exists
-if os.path.exists(DOWNLOAD_DIR):
-    shutil.rmtree(DOWNLOAD_DIR) # স্টার্টআপের সময় ক্লিন করা
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# Setup logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
-# yt-dlp এর অতিরিক্ত লগ কমানো
-logging.getLogger("yt_dlp").setLevel(logging.WARNING)
+
+# টোকেন চেক
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN environment variable is missing!")
+
+DOWNLOAD_DIR = "downloads"
+# FFmpeg পাথ সেট করা
+BIN_PATH = os.path.join(os.getcwd(), "bin")
+os.environ["PATH"] += os.pathsep + BIN_PATH
+
+# ডাউনলোড ফোল্ডার রিসেট
+if os.path.exists(DOWNLOAD_DIR):
+    try:
+        shutil.rmtree(DOWNLOAD_DIR)
+    except Exception as e:
+        logger.warning(f"Could not clean download dir: {e}")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # ============================================================================
 # GLOBAL STATE
 # ============================================================================
-download_tasks: Dict[str, Dict] = {}
-active_downloads: Dict[int, dict] = {}
-ptb_application: Optional[Application] = None  # টেলিগ্রাম অ্যাপ গ্লোবাল ভেরিয়েবল
+download_tasks = {}
+active_downloads = {}
+ptb_application = None
 
 # ============================================================================
-# HELPER CLASSES & FUNCTIONS
+# HELPERS
 # ============================================================================
-
 class DownloadRequest(BaseModel):
     url: str
     format_id: str
@@ -90,9 +93,6 @@ class ProgressTracker:
         self.lock = threading.Lock()
         self.percent = 0.0
         self.speed = 0.0
-        self.eta = 0
-        self.downloaded = 0
-        self.total = 0
         self.status = "downloading"
         self.filename = None
         self.error = None
@@ -103,19 +103,13 @@ class ProgressTracker:
         with self.lock:
             if d["status"] == "downloading":
                 self.status = "downloading"
-                if d.get("total_bytes"):
-                    self.total = d["total_bytes"]
-                    self.downloaded = d.get("downloaded_bytes", 0)
-                elif d.get("total_bytes_estimate"):
-                    self.total = d["total_bytes_estimate"]
-                    self.downloaded = d.get("downloaded_bytes", 0)
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                downloaded = d.get("downloaded_bytes", 0)
                 
-                if self.total:
-                    self.percent = (self.downloaded / self.total) * 100
+                if total:
+                    self.percent = (downloaded / total) * 100
                 
                 self.speed = d.get("speed", 0)
-                self.eta = d.get("eta", 0)
-                
                 if self.speed:
                     elapsed = time.time() - self.start_time
                     self.speed_history.append((elapsed, self.speed))
@@ -132,13 +126,10 @@ class ProgressTracker:
             return {
                 "percent": self.percent,
                 "speed": self.speed,
-                "eta": self.eta,
-                "downloaded": self.downloaded,
-                "total": self.total,
                 "status": self.status,
                 "filename": self.filename,
                 "error": self.error,
-                "speed_history": self.speed_history.copy() if self.speed_history else []
+                "speed_history": list(self.speed_history)
             }
 
 def download_worker(task_id: str, url: str, format_id: str, media_type: str):
@@ -156,8 +147,7 @@ def download_worker(task_id: str, url: str, format_id: str, media_type: str):
         "progress_hooks": [progress_hook],
         "quiet": True,
         "no_warnings": True,
-        # FFmpeg location explicitly defined for safety
-        "ffmpeg_location": os.path.join(os.getcwd(), "bin"),
+        "ffmpeg_location": BIN_PATH,
     }
 
     if media_type == "audio":
@@ -176,37 +166,8 @@ def download_worker(task_id: str, url: str, format_id: str, media_type: str):
     finally:
         download_tasks[task_id]["done"] = True
 
-# ============================================================================
-# TELEGRAM BOT HANDLERS
-# ============================================================================
-
-async def get_formats(url: str, filter_type: str) -> List[Dict]:
-    loop = asyncio.get_running_loop()
-    
-    def _fetch():
-        ydl_opts = {
-            "quiet": True, 
-            "no_warnings": True,
-            # Just extract info, don't download
-            "extract_flat": False, 
-        }
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                formats = info.get("formats", [])
-                
-                if filter_type == "audio":
-                    return [f for f in formats if f.get("vcodec") == "none" and f.get("acodec") != "none"]
-                else:
-                    return [f for f in formats if f.get("vcodec") != "none"]
-        except Exception as e:
-            logger.error(f"Error fetching formats: {e}")
-            return []
-    
-    return await loop.run_in_executor(None, _fetch)
-
-def generate_speed_graph(speed_history: List[tuple]) -> Optional[io.BytesIO]:
-    if len(speed_history) < 2:
+def generate_speed_graph(speed_history):
+    if not MATPLOTLIB_AVAILABLE or len(speed_history) < 2:
         return None
     try:
         times, speeds = zip(*speed_history)
@@ -226,35 +187,41 @@ def generate_speed_graph(speed_history: List[tuple]) -> Optional[io.BytesIO]:
         buf.seek(0)
         plt.close()
         return buf
-    except Exception:
+    except Exception as e:
+        logger.error(f"Graph error: {e}")
         return None
 
+# ============================================================================
+# BOT LOGIC
+# ============================================================================
+async def get_formats(url: str, filter_type: str):
+    loop = asyncio.get_running_loop()
+    def _fetch():
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                formats = info.get("formats", [])
+                if filter_type == "audio":
+                    return [f for f in formats if f.get("vcodec") == "none"]
+                return [f for f in formats if f.get("vcodec") != "none"]
+        except Exception:
+            return []
+    return await loop.run_in_executor(None, _fetch)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 **Hello!** I am a YouTube Downloader Bot on Render.\n"
-        "Send me a YouTube link to start!",
-        parse_mode='Markdown'
-    )
+    await update.message.reply_text("👋 **Ready to download!** Send a YouTube link.")
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
     text = update.message.text
-
-    if "youtube.com" in text or "youtu.be" in text:
+    if "youtu" in text:
+        active_downloads[update.effective_chat.id] = {"url": text}
         keyboard = [
-            [InlineKeyboardButton("🎵 Audio (MP3)", callback_data="audio")],
-            [InlineKeyboardButton("🎬 Video (MP4)", callback_data="video")],
+            [InlineKeyboardButton("🎵 Audio", callback_data="audio"),
+             InlineKeyboardButton("🎬 Video", callback_data="video")]
         ]
-        
-        active_downloads[chat_id] = {"url": text}
-        
-        await update.message.reply_text(
-            "📥 **Link received!** Select format:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode='Markdown'
-        )
+        await update.message.reply_text("Select format:", reply_markup=InlineKeyboardMarkup(keyboard))
     else:
-        await update.message.reply_text("❌ Please send a valid YouTube link.")
+        await update.message.reply_text("❌ Send a valid YouTube link.")
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -262,208 +229,130 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat.id
     data = query.data
 
-    if chat_id not in active_downloads:
-        await query.edit_message_text("⚠️ Session expired. Send link again.")
-        return
-
-    url = active_downloads[chat_id]["url"]
-
     if data in ["audio", "video"]:
+        if chat_id not in active_downloads:
+            await query.edit_message_text("⚠️ Session expired.")
+            return
+        
         await query.edit_message_text(f"🔍 Fetching {data} formats...")
-        formats = await get_formats(url, data)
+        formats = await get_formats(active_downloads[chat_id]["url"], data)
         
         if not formats:
-            await query.edit_message_text("❌ Failed to fetch formats.")
+            await query.edit_message_text("❌ No formats found.")
             return
 
         keyboard = []
-        unique_ids = set()
-        
-        # Simplify format selection for better UX
+        seen = set()
         count = 0
         formats.sort(key=lambda x: x.get('filesize') or 0, reverse=True)
-        
+
         for f in formats:
             fid = f['format_id']
-            if fid in unique_ids: continue
+            if fid in seen: continue
             
-            label = ""
-            if data == "audio":
-                abr = f.get('abr', 0)
-                if abr: label = f"{int(abr)} kbps"
-            else:
-                h = f.get('height')
-                if h: label = f"{h}p"
-            
-            if label:
-                unique_ids.add(fid)
+            label = f"{int(f.get('abr', 0))} kbps" if data == "audio" else f"{f.get('height')}p"
+            if label != "0 kbps" and label != "Nonep":
+                seen.add(fid)
                 keyboard.append([InlineKeyboardButton(label, callback_data=f"dl_{data}_{fid}")])
                 count += 1
+            if count >= 5: break
             
-            if count >= 6: break # Limit options
-
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
         await query.edit_message_text("Select Quality:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     elif data.startswith("dl_"):
         _, type_, fid = data.split("_", 2)
-        await query.edit_message_text("🚀 Starting download...")
-        
-        # Start download via internal API call logic (Direct call for efficiency)
+        url = active_downloads[chat_id]["url"]
         task_id = str(uuid.uuid4())
+        
         download_tasks[task_id] = {
-            "req": {"url": url, "format_id": fid, "media_type": type_},
-            "done": False,
-            "tracker": None
+            "req": {"url": url}, "done": False, "tracker": None
         }
         
-        # Start thread
-        t = threading.Thread(target=download_worker, args=(task_id, url, fid, type_))
-        t.daemon = True
-        t.start()
-        
-        active_downloads[chat_id]["task_id"] = task_id
+        threading.Thread(target=download_worker, args=(task_id, url, fid, type_), daemon=True).start()
+        await query.edit_message_text("🚀 Downloading...")
         await monitor_download(chat_id, query.message.id, task_id, context, type_)
-
-    elif data == "cancel":
-        if chat_id in active_downloads:
-            del active_downloads[chat_id]
-        await query.edit_message_text("🚫 Cancelled.")
 
 async def monitor_download(chat_id, msg_id, task_id, context, media_type):
     last_text = ""
-    start_time = time.time()
+    start_ts = time.time()
     
     while True:
         task = download_tasks.get(task_id)
         if not task: break
         
         tracker = task.get("tracker")
-        if not tracker:
-            await asyncio.sleep(1)
-            continue
+        if tracker:
+            snap = tracker.snapshot()
+            if snap["status"] in ["finished", "error"]: break
             
-        snap = tracker.snapshot()
-        status = snap["status"]
-        
-        if status in ["finished", "error"]:
-            break
-            
-        # Update progress message every 2 seconds to avoid flood limits
-        if time.time() - start_time > 2:
-            pct = snap['percent']
-            speed_mb = (snap['speed'] or 0) / 1000000
-            text = f"📥 **Downloading...**\n`{pct:.1f}%` complete\n🚀 `{speed_mb:.2f} MB/s`"
-            
-            if text != last_text:
-                try:
-                    await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text, parse_mode='Markdown')
-                    last_text = text
-                    start_time = time.time()
-                except: pass
-        
+            if time.time() - start_ts > 3:
+                text = f"📥 **Downloading...** {snap['percent']:.1f}%"
+                if text != last_text:
+                    try:
+                        await context.bot.edit_message_text(chat_id, msg_id, text=text, parse_mode='Markdown')
+                        last_text = text
+                        start_ts = time.time()
+                    except: pass
         await asyncio.sleep(1)
 
-    # Handle completion
+    task = download_tasks.get(task_id)
     if task and task.get("done"):
         snap = task["tracker"].snapshot()
-        if snap["status"] == "finished" and snap["filename"]:
+        if snap["status"] == "finished" and snap["filename"] and os.path.exists(snap["filename"]):
             fpath = snap["filename"]
-            
-            # Auto-correction for audio extension
-            if media_type == "audio" and not os.path.exists(fpath):
-                base, _ = os.path.splitext(fpath)
-                if os.path.exists(base + ".mp3"):
-                    fpath = base + ".mp3"
-            
-            if os.path.exists(fpath):
-                await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text="📤 Uploading to Telegram...")
+            # Rename if needed for audio
+            if media_type == "audio" and not fpath.endswith(".mp3"):
+                base = os.path.splitext(fpath)[0]
+                if os.path.exists(base + ".mp3"): fpath = base + ".mp3"
+
+            try:
+                await context.bot.edit_message_text(chat_id, msg_id, text="📤 Uploading...")
+                graph = generate_speed_graph(snap["speed_history"])
                 
-                try:
-                    # Graph
-                    graph = generate_speed_graph(snap["speed_history"])
-                    
-                    with open(fpath, 'rb') as f:
-                        if media_type == "audio":
-                            await context.bot.send_audio(chat_id, f, title="Audio", caption="✅ Downloaded via Render Bot")
-                        else:
-                            await context.bot.send_video(chat_id, f, caption="✅ Downloaded via Render Bot")
-                    
-                    if graph:
-                        await context.bot.send_photo(chat_id, graph, caption="📊 Speed Graph")
-                    
-                    # Cleanup
-                    os.remove(fpath)
-                    await context.bot.delete_message(chat_id, msg_id)
-                    
-                except Exception as e:
-                    await context.bot.send_message(chat_id, f"❌ Upload failed: {e}")
-            else:
-                await context.bot.send_message(chat_id, "❌ File not found on server.")
+                with open(fpath, 'rb') as f:
+                    if media_type == "audio":
+                        await context.bot.send_audio(chat_id, f, title="Audio", caption="✅ Done")
+                    else:
+                        await context.bot.send_video(chat_id, f, caption="✅ Done")
+                
+                if graph:
+                    await context.bot.send_photo(chat_id, graph)
+                
+                os.remove(fpath)
+                await context.bot.delete_message(chat_id, msg_id)
+            except Exception as e:
+                await context.bot.send_message(chat_id, f"❌ Upload error: {e}")
         else:
-            await context.bot.send_message(chat_id, f"❌ Error: {snap.get('error')}")
+            await context.bot.send_message(chat_id, f"❌ Download failed: {snap.get('error')}")
             
-    # Clean memory
-    if task_id in download_tasks:
-        del download_tasks[task_id]
+    if task_id in download_tasks: del download_tasks[task_id]
 
 # ============================================================================
-# FASTAPI APP & LIFESPAN (MAIN ENTRY POINT)
+# APP LIFESPAN
 # ============================================================================
-
-app = FastAPI()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    This handles the startup and shutdown of the Telegram Bot
-    alongside the FastAPI server.
-    """
-    global ptb_application
-    
-    if not BOT_TOKEN:
-        logger.error("No BOT_TOKEN found! Bot will not start.")
+    if BOT_TOKEN:
+        global ptb_application
+        ptb_application = Application.builder().token(BOT_TOKEN).build()
+        ptb_application.add_handler(CommandHandler("start", start))
+        ptb_application.add_handler(MessageHandler(filters.TEXT, handle_link))
+        ptb_application.add_handler(CallbackQueryHandler(button_callback))
+        
+        await ptb_application.initialize()
+        await ptb_application.start()
+        await ptb_application.updater.start_polling()
+        logger.info("✅ Bot Started")
         yield
-        return
+        await ptb_application.updater.stop()
+        await ptb_application.stop()
+        await ptb_application.shutdown()
+    else:
+        yield
 
-    # Initialize Bot
-    ptb_application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Add Handlers
-    ptb_application.add_handler(CommandHandler("start", start))
-    ptb_application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
-    ptb_application.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Start Bot
-    logger.info("Starting Telegram Bot...")
-    await ptb_application.initialize()
-    await ptb_application.start()
-    await ptb_application.updater.start_polling()
-    
-    yield
-    
-    # Shutdown Bot
-    logger.info("Stopping Telegram Bot...")
-    await ptb_application.updater.stop()
-    await ptb_application.stop()
-    await ptb_application.shutdown()
-
-# Register lifespan
 app = FastAPI(lifespan=lifespan)
-
-# Add CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.get("/")
-async def root():
-    return {"status": "running", "service": "Telegram Downloader Bot"}
-
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+def home():
+    return {"status": "active"}
